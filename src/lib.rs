@@ -1,3 +1,5 @@
+mod fork;
+
 use crossbeam::scope;
 use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, umount, MsFlags};
@@ -11,6 +13,8 @@ use std::io::Stdout;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
+
+use fork::fork_fn;
 
 // Network namespace file descriptor is created at /proc/{pid}/ns/net
 // To keep alive, we create a file at /var/run/netns/{name}
@@ -28,21 +32,8 @@ impl RawNetworkNamespace {
     fn new(name: &str) -> Self {
         // Namespace must be created as root (or setuid)
         // TODO: Check if possible with capabilities
-        let child = match unsafe { fork() } {
-            Ok(ForkResult::Parent { child, .. }) => {
-                println!(
-                    "Continuing execution in parent process, new child has pid: {}",
-                    child
-                );
-                loop {
-                    match waitpid(child, None).expect("wait failed") {
-                        nix::sys::wait::WaitStatus::StillAlive => (),
-                        _ => break,
-                    }
-                }
-                child
-            }
-            Ok(ForkResult::Child) => {
+        let child = fork_fn(
+            || {
                 let nsdir = "/var/run/netns";
                 unshare(CloneFlags::CLONE_NEWNET).expect("Failed to unshare network namespace");
                 mkdir(nsdir, Mode::empty()).ok();
@@ -66,9 +57,9 @@ impl RawNetworkNamespace {
                 )
                 .expect("Mount error");
                 std::process::exit(0);
-            }
-            Err(_) => panic!("Fork failed"),
-        };
+            },
+            true,
+        );
         Self {
             name: name.to_string(),
             pid: child.as_raw(),
@@ -88,6 +79,7 @@ impl RawNetworkNamespace {
 
         // TODO: Make this spawn from separate process, handle stdout
         // TODO: current directory, environment variables, user ID
+        // TODO: Make this use fork_fn
         // let handle = scope(|s| {
         //     let thread = s.spawn(|_| {
         let nsdir = "/var/run/netns";
