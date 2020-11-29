@@ -7,8 +7,9 @@ use nix::sched::{setns, unshare, CloneFlags};
 use nix::sys::signal::{kill, SIGKILL};
 use nix::sys::stat::Mode;
 use nix::sys::wait::waitpid;
-use nix::unistd::{close, getpid, mkdir, unlink};
-use nix::unistd::{fork, ForkResult};
+use nix::unistd::{close, dup2, getpid, mkdir, pipe, unlink};
+use nix::unistd::{execvp, fork, ForkResult};
+use std::ffi::CString;
 use std::io::Stdout;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::process::{Command, Stdio};
@@ -73,7 +74,7 @@ impl RawNetworkNamespace {
         unlink(ns_namepath.as_str()).expect("Unmount failed");
     }
 
-    fn exec_no_block(&self, command: &str, args: &[&str], silent: bool) -> std::process::Child {
+    fn exec_no_block(&self, command: &str, args: &[&str], silent: bool) -> nix::unistd::Pid {
         let stdout = std::io::stdout();
         let raw_fd: RawFd = stdout.as_raw_fd();
 
@@ -82,31 +83,45 @@ impl RawNetworkNamespace {
         // TODO: Make this use fork_fn
         // let handle = scope(|s| {
         //     let thread = s.spawn(|_| {
-        let nsdir = "/var/run/netns";
-        let ns_namepath = format!("{}/{}", nsdir, self.name);
-        println!("{}", ns_namepath);
+        let handle = fork_fn(
+            || {
+                let nsdir = "/var/run/netns";
+                let ns_namepath = format!("{}/{}", nsdir, self.name);
 
-        let mut oflag: OFlag = OFlag::empty();
-        oflag.insert(OFlag::O_RDONLY);
-        oflag.insert(OFlag::O_EXCL);
+                if silent {
+                    // Redirect stdout to /dev/null
+                    let stdout = std::io::stdout();
+                    let stderr = std::io::stderr();
 
-        let fd = open(ns_namepath.as_str(), oflag, Mode::empty()).expect("Open failed");
+                    let raw_fd_stdout: RawFd = stdout.as_raw_fd();
+                    let fd_null = open("/dev/null", OFlag::O_WRONLY, Mode::empty())
+                        .expect("Failed to open /dev/null");
+                    let raw_fd_stderr: RawFd = stderr.as_raw_fd();
 
-        setns(fd, CloneFlags::CLONE_NEWNET).expect("setns failed");
-        close(fd).expect("close failed");
-        let mut handle = Command::new(command);
-        handle.args(args);
-        if silent {
-            handle.stdout(Stdio::null());
-            handle.stderr(Stdio::null());
-        } else {
-            unsafe {
-                handle.stdout(Stdio::from_raw_fd(raw_fd));
-                handle.stderr(Stdio::from_raw_fd(raw_fd));
-            }
-        }
+                    dup2(fd_null, raw_fd_stdout).expect("Failed to overwrite stdout");
+                    dup2(fd_null, raw_fd_stderr).expect("Failed to overwrite stderr");
+                    close(fd_null).expect("Failed to close /dev/null fd");
+                }
 
-        let handle = handle.spawn().expect("Spawn failed");
+                let mut oflag: OFlag = OFlag::empty();
+                oflag.insert(OFlag::O_RDONLY);
+                oflag.insert(OFlag::O_EXCL);
+
+                let fd = open(ns_namepath.as_str(), oflag, Mode::empty()).expect("Open failed");
+
+                setns(fd, CloneFlags::CLONE_NEWNET).expect("setns failed");
+                close(fd).expect("close failed");
+
+                let command_c =
+                    CString::new(command).expect("Failed to convert command to CString");
+                let args_c: Result<Vec<CString>, _> =
+                    args.iter().map(|&x| CString::new(x)).collect();
+                let args_c = args_c.expect("Failed to convert args to CString");
+                execvp(&command_c, &args_c).expect("Failed to exec command");
+            },
+            false,
+        );
+
         // });
         // thread.join().unwrap()
         // })
@@ -142,7 +157,7 @@ mod tests {
         println!("test pid: {:?}", getpid().as_raw());
         let netns = RawNetworkNamespace::new("execns");
         println!("{:?}", netns);
-        let mut handle = netns.exec_no_block("ping", &["-c", "1", "8.8.8.8"], false);
+        let mut handle = netns.exec_no_block("ping", &["-c", "1", "8.8.8.8"], true);
         // handle.kill().expect("kill failed");
         // netns.destroy();
     }
