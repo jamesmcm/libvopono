@@ -2,7 +2,7 @@ use log::debug;
 use nix::sys::wait::waitpid;
 use nix::unistd::{fork, ForkResult};
 
-// TODO: Fix sharing of pipes - stdout
+// TODO: Allow return value from Closure if blocking?
 pub fn fork_fn(child_fun: impl FnOnce(), blocking: bool) -> nix::unistd::Pid {
     let child = match unsafe { fork() } {
         Ok(ForkResult::Parent { child, .. }) => {

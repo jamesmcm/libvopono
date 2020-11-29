@@ -1,6 +1,6 @@
 mod fork;
 
-use crossbeam::scope;
+use futures::stream::TryStreamExt;
 use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, umount, MsFlags};
 use nix::sched::{setns, unshare, CloneFlags};
@@ -74,20 +74,36 @@ impl RawNetworkNamespace {
         unlink(ns_namepath.as_str()).expect("Unmount failed");
     }
 
-    fn exec_no_block(&self, command: &str, args: &[&str], silent: bool) -> nix::unistd::Pid {
-        let stdout = std::io::stdout();
-        let raw_fd: RawFd = stdout.as_raw_fd();
-
-        // TODO: Make this spawn from separate process, handle stdout
-        // TODO: current directory, environment variables, user ID
-        // TODO: Make this use fork_fn
-        // let handle = scope(|s| {
-        //     let thread = s.spawn(|_| {
+    // TODO: Allow return value from Closure if blocking?
+    fn run_in_namespace(&self, fun: impl FnOnce(), blocking: bool) -> nix::unistd::Pid {
         let handle = fork_fn(
             || {
                 let nsdir = "/var/run/netns";
                 let ns_namepath = format!("{}/{}", nsdir, self.name);
+                let mut oflag: OFlag = OFlag::empty();
+                oflag.insert(OFlag::O_RDONLY);
+                oflag.insert(OFlag::O_EXCL);
 
+                let fd = open(ns_namepath.as_str(), oflag, Mode::empty()).expect("Open failed");
+
+                setns(fd, CloneFlags::CLONE_NEWNET).expect("setns failed");
+                close(fd).expect("close failed");
+
+                fun();
+            },
+            blocking,
+        );
+        handle
+    }
+
+    // TODO: Add blocking version, implement std::process::Command interface?
+    fn exec_no_block(&self, command: &[&str], silent: bool) -> nix::unistd::Pid {
+        let stdout = std::io::stdout();
+        let raw_fd: RawFd = stdout.as_raw_fd();
+
+        // TODO: current directory, user + group ID
+        let handle = self.run_in_namespace(
+            || {
                 if silent {
                     // Redirect stdout to /dev/null
                     let stdout = std::io::stdout();
@@ -103,31 +119,49 @@ impl RawNetworkNamespace {
                     close(fd_null).expect("Failed to close /dev/null fd");
                 }
 
-                let mut oflag: OFlag = OFlag::empty();
-                oflag.insert(OFlag::O_RDONLY);
-                oflag.insert(OFlag::O_EXCL);
-
-                let fd = open(ns_namepath.as_str(), oflag, Mode::empty()).expect("Open failed");
-
-                setns(fd, CloneFlags::CLONE_NEWNET).expect("setns failed");
-                close(fd).expect("close failed");
-
-                let command_c =
-                    CString::new(command).expect("Failed to convert command to CString");
                 let args_c: Result<Vec<CString>, _> =
-                    args.iter().map(|&x| CString::new(x)).collect();
+                    command.iter().map(|&x| CString::new(x)).collect();
                 let args_c = args_c.expect("Failed to convert args to CString");
-                execvp(&command_c, &args_c).expect("Failed to exec command");
+                execvp(args_c.first().expect("No command"), args_c.as_slice())
+                    .expect("Failed to exec command");
             },
             false,
         );
-
-        // });
-        // thread.join().unwrap()
-        // })
-        // .unwrap();
-        println!("{:?}", handle);
         handle
+    }
+
+    fn add_loopback(&mut self) {
+        self.run_in_namespace(
+            || {
+                let mut rt =
+                    tokio::runtime::Runtime::new().expect("Failed to construct Tokio runtime");
+                rt.spawn_blocking(|| {
+                    async {
+                        let (connection, handle, _) = rtnetlink::new_connection().unwrap();
+                        // let conn = connection));
+                        let mut links = handle
+                            .link()
+                            .get()
+                            .set_name_filter("lo".to_string())
+                            .execute();
+                        let ip = ipnetwork::IpNetwork::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                            8,
+                        )
+                        .expect("Failed to construct IP");
+                        if let Some(link) = links.try_next().await.expect("Failed to get link") {
+                            handle
+                                .address()
+                                .add(link.header.index, ip.ip(), ip.prefix())
+                                .execute()
+                                .await
+                                .expect("Failed to add address")
+                        }
+                    }
+                });
+            },
+            true,
+        );
     }
 }
 
@@ -157,8 +191,19 @@ mod tests {
         println!("test pid: {:?}", getpid().as_raw());
         let netns = RawNetworkNamespace::new("execns");
         println!("{:?}", netns);
-        let mut handle = netns.exec_no_block("ping", &["-c", "1", "8.8.8.8"], true);
-        // handle.kill().expect("kill failed");
-        // netns.destroy();
+        let handle = netns.exec_no_block(&["ping", "-c", "1", "8.8.8.8"], false);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        kill(handle, SIGKILL).expect("kill failed");
+        netns.destroy();
+    }
+    #[test]
+    fn add_loopback() {
+        let mut netns = RawNetworkNamespace::new("testlo");
+        netns.add_loopback();
+        // TODO: Make this blocking
+        let handle = netns.exec_no_block(&["ip", "addr"], false);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        kill(handle, SIGKILL).expect("kill failed");
+        netns.destroy();
     }
 }
