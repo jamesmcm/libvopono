@@ -135,32 +135,39 @@ impl RawNetworkNamespace {
             || {
                 let mut rt =
                     tokio::runtime::Runtime::new().expect("Failed to construct Tokio runtime");
-                rt.spawn_blocking(|| {
-                    async {
-                        let (connection, handle, _) = rtnetlink::new_connection().unwrap();
-                        // let conn = connection));
-                        let mut links = handle
+                let x = rt.block_on(async {
+                    let (connection, handle, _) = rtnetlink::new_connection().unwrap();
+                    let mut links = handle
+                        .link()
+                        .get()
+                        .set_name_filter("lo".to_string())
+                        .execute();
+                    let ip = ipnetwork::IpNetwork::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                        8,
+                    )
+                    .expect("Failed to construct IP");
+                    println!("ip: {:?}", ip);
+                    if let Some(link) = links.try_next().await.expect("Failed to get link") {
+                        handle
+                            .address()
+                            .add(link.header.index, ip.ip(), ip.prefix())
+                            .execute()
+                            .await
+                            .expect("Failed to add address");
+                        handle
                             .link()
-                            .get()
-                            .set_name_filter("lo".to_string())
-                            .execute();
-                        let ip = ipnetwork::IpNetwork::new(
-                            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                            8,
-                        )
-                        .expect("Failed to construct IP");
-                        if let Some(link) = links.try_next().await.expect("Failed to get link") {
-                            handle
-                                .address()
-                                .add(link.header.index, ip.ip(), ip.prefix())
-                                .execute()
-                                .await
-                                .expect("Failed to add address")
-                        }
+                            .set(link.header.index)
+                            .up()
+                            .execute()
+                            .await
+                            .expect("Failed to set link up");
                     }
                 });
+
+                std::process::exit(0);
             },
-            true,
+            false,
         );
     }
 }
@@ -201,6 +208,7 @@ mod tests {
         let mut netns = RawNetworkNamespace::new("testlo");
         netns.add_loopback();
         // TODO: Make this blocking
+        std::thread::sleep(std::time::Duration::from_secs(5));
         let handle = netns.exec_no_block(&["ip", "addr"], false);
         std::thread::sleep(std::time::Duration::from_secs(2));
         kill(handle, SIGKILL).expect("kill failed");
