@@ -141,14 +141,7 @@ impl RawNetworkNamespace {
                 let x = rt.block_on(async {
                     let (connection, handle, _) = rtnetlink::new_connection().unwrap();
 
-                    // Debug code: test if we ever get any links returned
-                    let mut links = handle.link().get().execute();
-                    println!("async closure runs but links are None");
-                    while let Some(l) = links.try_next().await.expect("fail link") {
-                        println!("{:?}", l);
-                    }
-                    // End debug code
-
+                    rt.spawn(connection);
                     let mut links = handle
                         .link()
                         .get()

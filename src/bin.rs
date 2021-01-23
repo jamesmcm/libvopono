@@ -1,6 +1,5 @@
 use libvopono::RawNetworkNamespace;
 use nix::sys::signal::{kill, SIGKILL};
-
 fn main() {
     let mut netns = RawNetworkNamespace::new("testlobin");
     let handle = netns.exec_no_block(&["ip", "addr"], false);
