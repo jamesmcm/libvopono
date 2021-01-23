@@ -21,8 +21,9 @@ use fork::fork_fn;
 // To keep alive, we create a file at /var/run/netns/{name}
 // then bind mount the namespace file descriptor to /var/run/netns/{name}
 // To destroy, unmount /var/run/netns/{name} and delete the created file there
+// TODO: Make this private?
 #[derive(Debug)]
-struct RawNetworkNamespace {
+pub struct RawNetworkNamespace {
     name: String,
     pid: i32,
 }
@@ -30,7 +31,7 @@ struct RawNetworkNamespace {
 // TODO: Implement exec, destroy (do not force on Drop here, that can be done in application if
 // desired), veth brige networking
 impl RawNetworkNamespace {
-    fn new(name: &str) -> Self {
+    pub fn new(name: &str) -> Self {
         // Namespace must be created as root (or setuid)
         // TODO: Check if possible with capabilities
         let child = fork_fn(
@@ -67,7 +68,7 @@ impl RawNetworkNamespace {
         }
     }
 
-    fn destroy(self) {
+    pub fn destroy(self) {
         let nsdir = "/var/run/netns";
         let ns_namepath = format!("{}/{}", nsdir, self.name);
         umount(ns_namepath.as_str()).expect("Unmount failed");
@@ -75,8 +76,8 @@ impl RawNetworkNamespace {
     }
 
     // TODO: Allow return value from Closure if blocking?
-    fn run_in_namespace(&self, fun: impl FnOnce(), blocking: bool) -> nix::unistd::Pid {
-        let handle = fork_fn(
+    pub fn run_in_namespace(&self, fun: impl FnOnce(), blocking: bool) -> nix::unistd::Pid {
+        fork_fn(
             || {
                 let nsdir = "/var/run/netns";
                 let ns_namepath = format!("{}/{}", nsdir, self.name);
@@ -92,17 +93,16 @@ impl RawNetworkNamespace {
                 fun();
             },
             blocking,
-        );
-        handle
+        )
     }
 
     // TODO: Add blocking version, implement std::process::Command interface?
-    fn exec_no_block(&self, command: &[&str], silent: bool) -> nix::unistd::Pid {
-        let stdout = std::io::stdout();
-        let raw_fd: RawFd = stdout.as_raw_fd();
+    pub fn exec_no_block(&self, command: &[&str], silent: bool) -> nix::unistd::Pid {
+        // let stdout = std::io::stdout();
+        // let raw_fd: RawFd = stdout.as_raw_fd();
 
         // TODO: current directory, user + group ID
-        let handle = self.run_in_namespace(
+        self.run_in_namespace(
             || {
                 if silent {
                     // Redirect stdout to /dev/null
@@ -126,17 +126,27 @@ impl RawNetworkNamespace {
                     .expect("Failed to exec command");
             },
             false,
-        );
-        handle
+        )
     }
 
-    fn add_loopback(&mut self) {
+    /// Create loopback and set up
+    /// Equivalent of:
+    /// ip netns exec netns ip addr add 127.0.0.1/8 dev lo
+    /// ip netns exec netns ip link set lo up
+    pub fn add_loopback(&mut self) {
         self.run_in_namespace(
             || {
                 let mut rt =
                     tokio::runtime::Runtime::new().expect("Failed to construct Tokio runtime");
                 let x = rt.block_on(async {
                     let (connection, handle, _) = rtnetlink::new_connection().unwrap();
+
+                    let mut links = handle.link().get().execute();
+                    println!("async closure runs but links are None");
+                    while let Some(l) = links.try_next().await.expect("fail link") {
+                        println!("{:?}", l);
+                    }
+
                     let mut links = handle
                         .link()
                         .get()
@@ -147,7 +157,6 @@ impl RawNetworkNamespace {
                         8,
                     )
                     .expect("Failed to construct IP");
-                    println!("ip: {:?}", ip);
                     if let Some(link) = links.try_next().await.expect("Failed to get link") {
                         handle
                             .address()
@@ -155,6 +164,9 @@ impl RawNetworkNamespace {
                             .execute()
                             .await
                             .expect("Failed to add address");
+
+                        println!("ip: {:?}", ip);
+                        std::thread::sleep(std::time::Duration::from_secs(2));
                         handle
                             .link()
                             .set(link.header.index)
