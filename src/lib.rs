@@ -17,11 +17,10 @@ use std::thread::sleep;
 
 use fork::fork_fn;
 
-// Network namespace file descriptor is created at /proc/{pid}/ns/net
-// To keep alive, we create a file at /var/run/netns/{name}
-// then bind mount the namespace file descriptor to /var/run/netns/{name}
-// To destroy, unmount /var/run/netns/{name} and delete the created file there
-// TODO: Make this private?
+/// Network namespace file descriptor is created at /proc/{pid}/ns/net
+/// To keep alive, we create a file at /var/run/netns/{name}
+/// then bind mount the namespace file descriptor to /var/run/netns/{name}
+/// To destroy, unmount /var/run/netns/{name} and delete the created file there
 #[derive(Debug)]
 pub struct RawNetworkNamespace {
     name: String,
@@ -76,6 +75,9 @@ impl RawNetworkNamespace {
     }
 
     // TODO: Allow return value from Closure if blocking?
+    // TODO: Can we do better than spawning a new process for every operation?
+    // Consider maintaining one process inside namespace with inter-process communication
+    // But need to handle possibility of many network namespaces
     pub fn run_in_namespace(&self, fun: impl FnOnce(), blocking: bool) -> nix::unistd::Pid {
         fork_fn(
             || {
@@ -160,8 +162,6 @@ impl RawNetworkNamespace {
                             .await
                             .expect("Failed to add address");
 
-                        println!("ip: {:?}", ip);
-                        std::thread::sleep(std::time::Duration::from_secs(2));
                         handle
                             .link()
                             .set(link.header.index)
@@ -177,10 +177,138 @@ impl RawNetworkNamespace {
             false,
         );
     }
+
+    pub fn add_veth_bridge(
+        &mut self,
+        src_name: &str,
+        dest_name: &str,
+        src_ip: &ipnetwork::IpNetwork,
+        dest_ip: &ipnetwork::IpNetwork,
+    ) {
+        // TODO: Refactor this to get device indices only once!
+        // On host - dest veth
+        let rt = tokio::runtime::Runtime::new().expect("Failed to construct Tokio runtime");
+        rt.block_on(async {
+            let (connection, handle, _) = rtnetlink::new_connection().unwrap();
+
+            rt.spawn(connection);
+            handle
+                .link()
+                .add()
+                .veth(dest_name.to_string(), src_name.to_string())
+                .execute()
+                .await
+                .expect("Failed to create veth link");
+
+            let mut links = handle
+                .link()
+                .get()
+                .set_name_filter(dest_name.to_string())
+                .execute();
+            if let Some(link) = links.try_next().await.expect("Failed to get dest link") {
+                handle
+                    .address()
+                    .add(link.header.index, dest_ip.ip(), dest_ip.prefix())
+                    .execute()
+                    .await
+                    .expect("Failed to add dest address");
+                handle
+                    .link()
+                    .set(link.header.index)
+                    .up()
+                    .execute()
+                    .await
+                    .expect("Failed to set link up");
+            }
+
+            // Move src to namespace
+
+            let mut links = handle
+                .link()
+                .get()
+                .set_name_filter(src_name.to_string())
+                .execute();
+
+            let fd_netns = open(
+                format!("/var/run/netns/{}", self.name).as_str(),
+                OFlag::O_RDONLY,
+                Mode::empty(),
+            )
+            .expect("Failed to open netns fd");
+            if let Some(link) = links.try_next().await.expect("Failed to get src link") {
+                println!("pid: {:?}", self.pid);
+                handle
+                    .link()
+                    .set(link.header.index)
+                    .setns_by_fd(fd_netns)
+                    .execute()
+                    .await
+                    .expect("Failed to move and set src link up");
+            }
+            close(fd_netns).expect("Failed to close netns fd");
+        });
+
+        // In netns - src veth
+        self.run_in_namespace(
+            || {
+                let rt = tokio::runtime::Runtime::new().expect("Failed to construct Tokio runtime");
+                rt.block_on(async {
+                    let (connection, handle, _) = rtnetlink::new_connection().unwrap();
+
+                    rt.spawn(connection);
+
+                    let mut links = handle
+                        .link()
+                        .get()
+                        .set_name_filter(src_name.to_string())
+                        .execute();
+                    if let Some(link) = links.try_next().await.expect("Failed to get src link") {
+                        handle
+                            .address()
+                            .add(link.header.index, src_ip.ip(), src_ip.prefix())
+                            .execute()
+                            .await
+                            .expect("Failed to add src address");
+
+                        // May be unnecessary since we set up when moving in to this namespace
+                        handle
+                            .link()
+                            .set(link.header.index)
+                            .up()
+                            .execute()
+                            .await
+                            .expect("Failed to set link up");
+
+                        // TODO: Fix me - how to specify as default gateway
+                        // Route default gateway - ip netns exec piavpn ip route add default via 10.200.200.1 dev vpn1
+                        let route = handle.route();
+                        let dest_ipv4 = if let std::net::IpAddr::V4(ip) = dest_ip.ip() {
+                            ip
+                        } else {
+                            panic!("Bad ipv4 IP for veth gateway");
+                        };
+                        route
+                            .add()
+                            .input_interface(link.header.index)
+                            .v4()
+                            .gateway(dest_ipv4)
+                            .execute()
+                            .await
+                            .expect("Failed to add veth route");
+                    }
+                });
+
+                std::process::exit(0);
+            },
+            false,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    // Tests must be run with superuser privileges :(
+    // sudo -E cargo test
     use super::*;
     #[test]
     fn create_netns() {
