@@ -1,3 +1,4 @@
+mod errors;
 mod fork;
 
 use futures::stream::TryStreamExt;
@@ -16,6 +17,8 @@ use std::process::{Command, Stdio};
 use std::thread::sleep;
 
 use fork::fork_fn;
+use nftnl::{nft_expr, nftnl_sys::libc, Batch, Chain, FinalizedBatch, ProtoFamily, Rule, Table};
+use sysctl::Sysctl;
 
 /// Network namespace file descriptor is created at /proc/{pid}/ns/net
 /// To keep alive, we create a file at /var/run/netns/{name}
@@ -98,7 +101,7 @@ impl RawNetworkNamespace {
         )
     }
 
-    // TODO: Add blocking version, implement std::process::Command interface?
+    // TODO: Add blocking version, implement std::process::Command interface? + IPC?
     pub fn exec_no_block(&self, command: &[&str], silent: bool) -> nix::unistd::Pid {
         // let stdout = std::io::stdout();
         // let raw_fd: RawFd = stdout.as_raw_fd();
@@ -138,9 +141,8 @@ impl RawNetworkNamespace {
     pub fn add_loopback(&mut self) {
         self.run_in_namespace(
             || {
-                let mut rt =
-                    tokio::runtime::Runtime::new().expect("Failed to construct Tokio runtime");
-                let x = rt.block_on(async {
+                let rt = tokio::runtime::Runtime::new().expect("Failed to construct Tokio runtime");
+                rt.block_on(async {
                     let (connection, handle, _) = rtnetlink::new_connection().unwrap();
 
                     rt.spawn(connection);
@@ -222,7 +224,6 @@ impl RawNetworkNamespace {
             }
 
             // Move src to namespace
-
             let mut links = handle
                 .link()
                 .get()
@@ -279,7 +280,6 @@ impl RawNetworkNamespace {
                             .await
                             .expect("Failed to set link up");
 
-                        // TODO: Fix me - how to specify as default gateway
                         // Route default gateway - ip netns exec piavpn ip route add default via 10.200.200.1 dev vpn1
                         let route = handle.route();
                         let dest_ipv4 = if let std::net::IpAddr::V4(ip) = dest_ip.ip() {
@@ -303,6 +303,111 @@ impl RawNetworkNamespace {
             false,
         );
     }
+}
+
+pub fn host_add_masquerade_nft(
+    table_name: &str,
+    chain_name: &str,
+    interface_name: &str,
+    ip_mask: &str,
+) {
+    // TODO: Finish this and add Error types
+    // Get interface index with rtnetlink instead?
+
+    let mut batch = Batch::new();
+
+    // Add table: nft add table inet vopono_nat
+    let table = Table::new(&CString::new(table_name).unwrap(), ProtoFamily::Inet);
+    batch.add(&table, nftnl::MsgType::Add);
+
+    // Add postrouting chain: nft add chain inet vopono_nat postrouting { type nat hook postrouting priority 100 ; }
+    // // TODO update this to set nat type etc.
+    let mut out_chain = Chain::new(&CString::new(chain_name).unwrap(), &table);
+    out_chain.set_hook(nftnl::Hook::PostRouting, 100);
+    out_chain.set_type(nftnl::ChainType::Nat);
+    // out_chain.set_policy(nftnl::Policy::Accept);
+    batch.add(&out_chain, nftnl::MsgType::Add);
+
+    // Add masquerade rule: nft add rule inet vopono_nat postrouting oifname &interface.name ip saddr &ip_mask counter masquerade
+    let mut allow_loopback_in_rule = Rule::new(&out_chain);
+    // TODO: Get index from rtnetlink?
+    // let lo_iface_index = iface_index(interface_name).expect("TODO ERROR");
+
+    // TODO Fix below vs. vopono, currently gives:
+    // table inet vopono_nat {
+    //         chain vopono_nat {
+    //                 type nat hook postrouting priority srcnat; policy accept;
+    //                 oifname "e*" counter packets 0 bytes 0 masquerade
+    //         }
+    // }
+    // netlink: Error: Relational expression size mismatch
+    allow_loopback_in_rule.add_expr(&nft_expr!(meta oifname));
+    allow_loopback_in_rule.add_expr(&nft_expr!(cmp == interface_name));
+    // TODO: Does this work on non-ethernet output interfaces?
+    allow_loopback_in_rule.add_expr(&nft_expr!(payload ethernet saddr));
+    allow_loopback_in_rule.add_expr(&nft_expr!(cmp == ip_mask));
+    allow_loopback_in_rule.add_expr(&nft_expr!(counter));
+    allow_loopback_in_rule.add_expr(&nft_expr!(masquerade));
+
+    batch.add(&allow_loopback_in_rule, nftnl::MsgType::Add);
+    let finalized_batch = batch.finalize();
+
+    // TODO: Error handling
+    send_and_process(&finalized_batch);
+}
+
+fn send_and_process(batch: &FinalizedBatch) {
+    // Create a netlink socket to netfilter.
+    let socket = mnl::Socket::new(mnl::Bus::Netfilter).expect("TODO ERROR");
+    // Send all the bytes in the batch.
+    socket.send_all(batch).expect("TODO ERROR");
+
+    // Try to parse the messages coming back from netfilter. This part is still very unclear.
+    let portid = socket.portid();
+    let mut buffer = vec![0; nftnl::nft_nlmsg_maxsize() as usize];
+    let very_unclear_what_this_is_for = 2;
+    while let Some(message) = socket_recv(&socket, &mut buffer[..]).expect("TODO ERROR") {
+        match mnl::cb_run(message, very_unclear_what_this_is_for, portid).expect("TODO ERROR") {
+            mnl::CbResult::Stop => {
+                break;
+            }
+            mnl::CbResult::Ok => (),
+        }
+    }
+    // Ok(())
+}
+
+// TODO - replace this with rtnetlink calls?
+fn iface_index(name: &str) -> Result<libc::c_uint, std::io::Error> {
+    let c_name = CString::new(name)?;
+    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if index == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(index)
+    }
+}
+
+fn socket_recv<'a>(
+    socket: &mnl::Socket,
+    buf: &'a mut [u8],
+) -> Result<Option<&'a [u8]>, Box<dyn std::error::Error>> {
+    let ret = socket.recv(buf)?;
+    if ret > 0 {
+        Ok(Some(&buf[..ret]))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn host_enable_ipv4_forwarding() {
+    // sysctl -q net.ipv4.ip_forward=1
+    let ctl = sysctl::Ctl::new("net.ipv4.ip_forward").expect("TODO ERROR sysctl");
+    let org = ctl.value().unwrap();
+    println!("original sysctl val: {}", org);
+    let set = ctl
+        .set_value(sysctl::CtlValue::String("1".to_string()))
+        .expect("TODO ERROR sysctl");
 }
 
 #[cfg(test)]
