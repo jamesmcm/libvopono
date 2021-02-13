@@ -2,6 +2,7 @@ mod errors;
 mod fork;
 
 use futures::stream::TryStreamExt;
+use ipnetwork::Ipv4Network;
 use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, umount, MsFlags};
 use nix::sched::{setns, unshare, CloneFlags};
@@ -292,6 +293,7 @@ impl RawNetworkNamespace {
                             .input_interface(link.header.index)
                             .v4()
                             .gateway(dest_ipv4)
+                            .protocol(0)
                             .execute()
                             .await
                             .expect("Failed to add veth route");
@@ -309,7 +311,7 @@ pub fn host_add_masquerade_nft(
     table_name: &str,
     chain_name: &str,
     interface_name: &str,
-    ip_mask: &str,
+    ip_mask: ipnetwork::IpNetwork,
 ) {
     // TODO: Finish this and add Error types
     // Get interface index with rtnetlink instead?
@@ -333,19 +335,21 @@ pub fn host_add_masquerade_nft(
     // TODO: Get index from rtnetlink?
     // let lo_iface_index = iface_index(interface_name).expect("TODO ERROR");
 
-    // TODO Fix below vs. vopono, currently gives:
-    // table inet vopono_nat {
-    //         chain vopono_nat {
-    //                 type nat hook postrouting priority srcnat; policy accept;
-    //                 oifname "e*" counter packets 0 bytes 0 masquerade
-    //         }
-    // }
-    // netlink: Error: Relational expression size mismatch
+    let ipnet = ip_mask;
     allow_loopback_in_rule.add_expr(&nft_expr!(meta oifname));
-    allow_loopback_in_rule.add_expr(&nft_expr!(cmp == interface_name));
-    // TODO: Does this work on non-ethernet output interfaces?
-    allow_loopback_in_rule.add_expr(&nft_expr!(payload ethernet saddr));
-    allow_loopback_in_rule.add_expr(&nft_expr!(cmp == ip_mask));
+    allow_loopback_in_rule.add_expr(&nft_expr!(
+        cmp == nftnl::expr::InterfaceName::Exact(
+            CString::new(interface_name).expect("Bad interface name to CString conversion")
+        )
+    ));
+
+    allow_loopback_in_rule.add_expr(&nft_expr!(meta nfproto));
+    allow_loopback_in_rule.add_expr(&nft_expr!(cmp == libc::NFPROTO_IPV4 as u8));
+
+    allow_loopback_in_rule.add_expr(&nft_expr!(payload ipv4 saddr));
+    allow_loopback_in_rule.add_expr(&nft_expr!(bitwise mask ipnet.mask(), xor 0));
+    allow_loopback_in_rule.add_expr(&nft_expr!(cmp == ipnet.ip()));
+
     allow_loopback_in_rule.add_expr(&nft_expr!(counter));
     allow_loopback_in_rule.add_expr(&nft_expr!(masquerade));
 
@@ -405,7 +409,7 @@ pub fn host_enable_ipv4_forwarding() {
     let ctl = sysctl::Ctl::new("net.ipv4.ip_forward").expect("TODO ERROR sysctl");
     let org = ctl.value().unwrap();
     println!("original sysctl val: {}", org);
-    let set = ctl
+    let _set = ctl
         .set_value(sysctl::CtlValue::String("1".to_string()))
         .expect("TODO ERROR sysctl");
 }
