@@ -1,6 +1,5 @@
 use ipnetwork::{IpNetwork, Ipv4Network};
-use libvopono::RawNetworkNamespace;
-use libvopono::{host_add_masquerade_nft, host_enable_ipv4_forwarding};
+use libvopono::*;
 use nix::sys::signal::{kill, SIGKILL};
 use std::net::Ipv4Addr;
 fn main() {
@@ -36,8 +35,18 @@ fn main() {
         24,
     )
     .expect("Failed to construct IP");
-    host_add_masquerade_nft("vopono_nat", "vopono_nat", "enp0s31f6", ipnet);
+    host_add_masquerade_nft("vopono_nat", "vopono_nat", "wlp1s0", ipnet);
     host_enable_ipv4_forwarding();
+
+    // Create Wireguard device - ip link
+    netns.add_wireguard_device("vopono_wg");
+    netns.set_wireguard_device(
+        "vopono_wg",
+        &std::path::Path::new("/home/archie/.config/vopono/mv/wireguard/usa-us4.conf"),
+    );
+
+    // Set Wireguard device config - from file
+    // Set firewall rules
     // kill(handle, SIGKILL).expect("kill failed");
     // netns.destroy();
 }

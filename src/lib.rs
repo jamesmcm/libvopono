@@ -1,5 +1,6 @@
 mod errors;
 mod fork;
+mod wg_config;
 
 use futures::stream::TryStreamExt;
 use ipnetwork::Ipv4Network;
@@ -11,11 +12,19 @@ use nix::sys::stat::Mode;
 use nix::sys::wait::waitpid;
 use nix::unistd::{close, dup2, getpid, mkdir, pipe, unlink};
 use nix::unistd::{execvp, fork, ForkResult};
+use regex::Regex;
+use std::convert::TryInto;
 use std::ffi::CString;
 use std::io::Stdout;
+use std::io::Write;
+use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread::sleep;
+use wireguard_uapi::{RouteSocket, WgSocket};
+
+use wg_config::WireguardConfig;
 
 use fork::fork_fn;
 use nftnl::{nft_expr, nftnl_sys::libc, Batch, Chain, FinalizedBatch, ProtoFamily, Rule, Table};
@@ -305,6 +314,14 @@ impl RawNetworkNamespace {
             false,
         );
     }
+
+    pub fn add_wireguard_device(&self, name: &str) {
+        self.run_in_namespace(|| add_wireguard_device(name), true);
+    }
+
+    pub fn set_wireguard_device(&self, name: &str, config_file: &Path) {
+        self.run_in_namespace(|| set_wireguard_device(name, config_file), true);
+    }
 }
 
 pub fn host_add_masquerade_nft(
@@ -414,6 +431,60 @@ pub fn host_enable_ipv4_forwarding() {
         .expect("TODO ERROR sysctl");
 }
 
+pub fn add_wireguard_device(name: &str) {
+    wireguard_uapi::RouteSocket::connect()
+        .expect("failed to connect route socket")
+        .add_device(name)
+        .expect("Failed to add wg device")
+}
+
+pub fn set_wireguard_device(name: &str, config_file: &Path) {
+    let config_string = std::fs::read_to_string(&config_file).unwrap();
+
+    // TODO: Avoid hacky regex for valid toml
+    let re = Regex::new(r"(?P<key>[^\s]+) = (?P<value>[^\s]+)").unwrap();
+    let mut config_string = re
+        .replace_all(&config_string, "$key = \"$value\"")
+        .to_string();
+    config_string.push('\n');
+    let config: WireguardConfig = toml::from_str(&config_string).unwrap();
+    let mut dev = wireguard_uapi::linux::set::Device::from_ifname(name);
+    let private_key_vec = base64::decode(config.interface.private_key).unwrap();
+    let mut privkey: [u8; 32] = [0; 32];
+    for i in 0..privkey.len() {
+        privkey[i] = private_key_vec[i];
+    }
+
+    let mut dev = dev.private_key(&privkey);
+    // TODO: Are we assuming only one peer here?
+    let mut dev = dev.flags(vec![wireguard_uapi::linux::set::WgDeviceF::ReplacePeers]);
+    let mut dev = dev.listen_port(0);
+    let mut dev = dev.fwmark(0);
+
+    let public_key_vec = base64::decode(config.peer.public_key).unwrap();
+    let mut pubkey: [u8; 32] = [0; 32];
+    for i in 0..pubkey.len() {
+        pubkey[i] = public_key_vec[i];
+    }
+    let mut peer = wireguard_uapi::linux::set::Peer::from_public_key(&pubkey);
+    let mut peer = peer.flags(vec![wireguard_uapi::linux::set::WgPeerF::ReplaceAllowedIps]);
+    let mut peer = peer.endpoint(&config.peer.endpoint);
+
+    let addrs: Vec<IpAddr> = config.peer.allowed_ips.iter().map(|x| x.addr()).collect();
+
+    let allowed_ips = addrs
+        .iter()
+        .map(|x| {
+            let mut ip = wireguard_uapi::linux::set::AllowedIp::from_ipaddr(&x);
+            ip.cidr_mask = Some(0);
+            ip
+        })
+        .collect::<Vec<_>>();
+    let mut peer = peer.allowed_ips(allowed_ips);
+    let mut dev = dev.peers(vec![peer]);
+    let mut socket = wireguard_uapi::WgSocket::connect().unwrap();
+    socket.set_device(dev).unwrap();
+}
 #[cfg(test)]
 mod tests {
     // Tests must be run with superuser privileges :(

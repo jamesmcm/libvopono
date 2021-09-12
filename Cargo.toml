@@ -10,15 +10,22 @@ edition = "2018"
 
 [dependencies]
 futures = "0.3"
-ipnetwork = "0.17"
+ipnetwork = "0.18"
+anyhow = "1"
 log = "0.4"
 mnl = "0.2.0"
 nftnl = "0.6.0"
-nix = "0.19"
-rtnetlink = "0.7"
+nix = "0.22"
+rtnetlink = "0.8"
 sysctl = "0.4.0"
+toml = "0.5"
+serde = {version = "1", features = ["derive", "std"]}
+ipnet = {version = "2", features = ["serde"]}
+regex = "1"
 thiserror = "1"
 tokio = {version = "1", default_features = false, features = ["rt", "rt-multi-thread"]}
+wireguard-uapi = "2"
+base64 = "0.13.0"
 # tokio = { version = "0.3", features = ["full"] }
 
 [[bin]]
