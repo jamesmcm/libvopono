@@ -38,15 +38,22 @@ fn main() {
     host_add_masquerade_nft("vopono_nat", "vopono_nat", "wlp1s0", ipnet);
     host_enable_ipv4_forwarding();
 
-    // Create Wireguard device - ip link
-    netns.add_wireguard_device("vopono_wg");
-    netns.set_wireguard_device(
-        "vopono_wg",
-        &std::path::Path::new("/home/archie/.config/vopono/mv/wireguard/usa-us4.conf"),
-    );
+    // Standard internet connection should work at this point
 
-    // Set Wireguard device config - from file
+    // Create Wireguard device - ip link
+    // TODO: Wrap this so we can destroy it later
+    netns.add_wireguard_device("vopono_wg");
+    // Set Wireguard device config
+    let config = read_wg_config(std::path::Path::new(
+        "/home/archie/.config/vopono/mv/wireguard/usa-us4.conf",
+    ));
+    netns.set_wireguard_device("vopono_wg", &config);
+    netns.wg_dev_up("vopono_wg", &config);
+
+    // Set up routing
+    // Set up DNS
     // Set firewall rules
+
     // kill(handle, SIGKILL).expect("kill failed");
     // netns.destroy();
 }

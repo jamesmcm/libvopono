@@ -18,6 +18,7 @@ use std::ffi::CString;
 use std::io::Stdout;
 use std::io::Write;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -319,8 +320,68 @@ impl RawNetworkNamespace {
         self.run_in_namespace(|| add_wireguard_device(name), true);
     }
 
-    pub fn set_wireguard_device(&self, name: &str, config_file: &Path) {
-        self.run_in_namespace(|| set_wireguard_device(name, config_file), true);
+    pub fn set_wireguard_device(&self, name: &str, config: &WireguardConfig) {
+        self.run_in_namespace(|| set_wireguard_device(name, config), true);
+    }
+
+    /// Equivalent of:
+    /// ip -6 address add {address} dev {name}
+    /// ip -4 address add {address} dev {name}
+    /// ip link set mtu 1420 up dev {name}
+    pub fn wg_dev_up(&self, name: &str, config: &WireguardConfig) {
+        self.run_in_namespace(
+            || {
+                let rt = tokio::runtime::Runtime::new().expect("Failed to construct Tokio runtime");
+                rt.block_on(async {
+                    let (connection, handle, _) = rtnetlink::new_connection().unwrap();
+
+                    rt.spawn(connection);
+                    let mut links = handle
+                        .link()
+                        .get()
+                        .set_name_filter(name.to_string())
+                        .execute();
+
+                    if let Some(link) = links.try_next().await.expect("Failed to get link") {
+                        for address in config.interface.address.iter() {
+                            handle
+                                .address()
+                                .add(link.header.index, address.addr(), 32)
+                                .execute()
+                                .await
+                                .expect("Failed to add address");
+
+                            // TODO: custom MTU
+                            handle
+                                .link()
+                                .set(link.header.index)
+                                .mtu(1420)
+                                .up()
+                                .execute()
+                                .await
+                                .expect("Failed to set link up");
+                        }
+
+                        let route = handle.route();
+                        // TODO: Fix me
+                        route
+                            .add()
+                            .input_interface(link.header.index)
+                            .v4()
+                            .table(111)
+                            .destination_prefix(Ipv4Addr::new(0, 0, 0, 0), 0)
+                            .execute()
+                            .await
+                            .expect("Failed to add Wireguard route");
+                    }
+                    //TODO:
+                    // "ip", "-4", "rule", "add", "not", "fwmark", fwmark, "table", fwmark
+                    // "ip","-4","rule","add","table","main","suppress_prefixlength","0",
+                });
+                std::process::exit(0);
+            },
+            false,
+        );
     }
 }
 
@@ -431,6 +492,7 @@ pub fn host_enable_ipv4_forwarding() {
         .expect("TODO ERROR sysctl");
 }
 
+/// Equivalent of: ip link add {name} type wireguard
 pub fn add_wireguard_device(name: &str) {
     wireguard_uapi::RouteSocket::connect()
         .expect("failed to connect route socket")
@@ -438,7 +500,7 @@ pub fn add_wireguard_device(name: &str) {
         .expect("Failed to add wg device")
 }
 
-pub fn set_wireguard_device(name: &str, config_file: &Path) {
+pub fn read_wg_config(config_file: &Path) -> WireguardConfig {
     let config_string = std::fs::read_to_string(&config_file).unwrap();
 
     // TODO: Avoid hacky regex for valid toml
@@ -447,9 +509,16 @@ pub fn set_wireguard_device(name: &str, config_file: &Path) {
         .replace_all(&config_string, "$key = \"$value\"")
         .to_string();
     config_string.push('\n');
-    let config: WireguardConfig = toml::from_str(&config_string).unwrap();
+    toml::from_str(&config_string).unwrap()
+}
+
+// TODO: Change wireguard_uapi api to use &mut here for chaining?
+// TODO: Change API to make AllowedIP take ownership
+// TODO: Change API to accept Vec instead of only 32-bit array for keys
+/// Equivalent of: wg setconf {name} {config_file}
+pub fn set_wireguard_device(name: &str, config: &WireguardConfig) {
     let mut dev = wireguard_uapi::linux::set::Device::from_ifname(name);
-    let private_key_vec = base64::decode(config.interface.private_key).unwrap();
+    let private_key_vec = base64::decode(config.interface.private_key.clone()).unwrap();
     let mut privkey: [u8; 32] = [0; 32];
     for i in 0..privkey.len() {
         privkey[i] = private_key_vec[i];
@@ -459,9 +528,10 @@ pub fn set_wireguard_device(name: &str, config_file: &Path) {
     // TODO: Are we assuming only one peer here?
     let mut dev = dev.flags(vec![wireguard_uapi::linux::set::WgDeviceF::ReplacePeers]);
     let mut dev = dev.listen_port(0);
-    let mut dev = dev.fwmark(0);
+    // TODO: is it okay to set this here?
+    let mut dev = dev.fwmark(111);
 
-    let public_key_vec = base64::decode(config.peer.public_key).unwrap();
+    let public_key_vec = base64::decode(config.peer.public_key.clone()).unwrap();
     let mut pubkey: [u8; 32] = [0; 32];
     for i in 0..pubkey.len() {
         pubkey[i] = public_key_vec[i];
