@@ -300,7 +300,7 @@ impl RawNetworkNamespace {
                         };
                         route
                             .add()
-                            .input_interface(link.header.index)
+                            .output_interface(link.header.index)
                             .v4()
                             .gateway(dest_ipv4)
                             .protocol(0)
@@ -344,6 +344,7 @@ impl RawNetworkNamespace {
 
                     if let Some(link) = links.try_next().await.expect("Failed to get link") {
                         for address in config.interface.address.iter() {
+                            // TODO: device is not specified here?
                             handle
                                 .address()
                                 .add(link.header.index, address.addr(), 32)
@@ -362,11 +363,15 @@ impl RawNetworkNamespace {
                                 .expect("Failed to set link up");
                         }
 
+                        // ip -4 route add 0.0.0.0/0 dev {if_name} table {fwmark}
                         let route = handle.route();
-                        // TODO: Fix me
                         route
                             .add()
-                            .input_interface(link.header.index)
+                            // TODO: This gets a cryptic error when this is input_interface and no
+                            // error from the rtnetlink crate!
+                            // Would it be possible to improve this API to catch bad requests
+                            // at build time?
+                            .output_interface(link.header.index)
                             .v4()
                             .table(111)
                             .destination_prefix(Ipv4Addr::new(0, 0, 0, 0), 0)
@@ -376,7 +381,15 @@ impl RawNetworkNamespace {
                     }
                     //TODO:
                     // "ip", "-4", "rule", "add", "not", "fwmark", fwmark, "table", fwmark
+                    // https://github.com/svinota/pyroute2/issues/756
+                    // Also need NLAs? :(
                     // "ip","-4","rule","add","table","main","suppress_prefixlength","0",
+                    // Probably not needed inside netns: but can try to implement with attributes
+                    // https://stackoverflow.com/questions/65178004/what-does-ip-4-rule-add-table-main-suppress-prefixlength-0-meaning
+                    // Added as attribute
+                    // addattr32(&req.n, sizeof(req), FRA_SUPPRESS_PREFIXLEN, pl);
+                    // append to request NLAs directly?
+                    // https://docs.rs/netlink-packet-route/0.7.1/netlink_packet_route/rtnl/route/nlas/enum.Nla.html
                 });
                 std::process::exit(0);
             },
